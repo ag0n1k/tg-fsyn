@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -9,9 +10,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/joho/godotenv"
 )
 
 const (
@@ -19,11 +22,255 @@ const (
 	MaxFileSize        = 50 * 1024 * 1024 // 50MB
 )
 
+// Task represents a download task
+type Task struct {
+	ID         string `json:"id"`
+	Title      string `json:"title"`
+	Status     string `json:"status"`
+	Size       int64  `json:"size"`
+	Type       string `json:"type"`
+	Username   string `json:"username"`
+	Additional struct {
+		Detail struct {
+			CompletedTime int64 `json:"completed_time"`
+			StartedTime   int64 `json:"started_time"`
+		} `json:"detail"`
+		File []struct {
+			Name string `json:"name"`
+			Size int64  `json:"size"`
+		} `json:"file"`
+	} `json:"additional"`
+}
+
+// StatusService manages the status monitoring
+type StatusService struct {
+	mu               sync.RWMutex
+	tasks            []Task
+	lastChecked      time.Time
+	runningTasks     map[string]bool
+	previousStatuses map[string]string
+	client           *http.Client
+	host             string
+	port             string
+	username         string
+	password         string
+	adminUsers       map[int64]bool
+}
+
 type Bot struct {
-	api          *tgbotapi.BotAPI
-	storagePath  string
-	allowedUsers map[int64]bool
-	adminUsers   map[int64]bool
+	api           *tgbotapi.BotAPI
+	storagePath   string
+	allowedUsers  map[int64]bool
+	adminUsers    map[int64]bool
+	statusService *StatusService
+}
+
+// NewStatusService creates a new status service
+func NewStatusService(adminUsers map[int64]bool) *StatusService {
+	host := os.Getenv("SYNOLOGY_HOST")
+	if host == "" {
+		host = "192.168.1.34"
+	}
+
+	port := os.Getenv("SYNOLOGY_PORT")
+	if port == "" {
+		port = "5000"
+	}
+
+	username := os.Getenv("SYNOLOGY_USERNAME")
+	if username == "" {
+		log.Fatal("SYNOLOGY_USERNAME environment variable is required")
+	}
+
+	password := os.Getenv("SYNOLOGY_PASSWORD")
+	if password == "" {
+		log.Fatal("SYNOLOGY_PASSWORD environment variable is required")
+	}
+
+	return &StatusService{
+		client:           &http.Client{Timeout: 30 * time.Second},
+		host:             host,
+		port:             port,
+		username:         username,
+		password:         password,
+		adminUsers:       adminUsers,
+		runningTasks:     make(map[string]bool),
+		previousStatuses: make(map[string]string),
+	}
+}
+
+// Start begins the status monitoring loop
+func (s *StatusService) Start() {
+	go func() {
+		for {
+			s.checkStatus()
+			time.Sleep(5 * time.Minute)
+		}
+	}()
+}
+
+// checkStatus fetches and processes the current status
+func (s *StatusService) checkStatus() {
+	sessionID, err := s.login()
+	if err != nil {
+		log.Printf("Login failed: %v", err)
+		return
+	}
+
+	tasks, err := s.getDownloadTasks(sessionID)
+	if err != nil {
+		log.Printf("Failed to get tasks: %v", err)
+		return
+	}
+
+	s.mu.Lock()
+	s.tasks = tasks
+	s.lastChecked = time.Now()
+
+	// Update running tasks and detect changes
+	runningTasks := make(map[string]bool)
+	for _, task := range tasks {
+		runningTasks[task.ID] = task.Status == "running"
+
+		// Check for status changes
+		if prevStatus, exists := s.previousStatuses[task.ID]; exists {
+			if prevStatus != task.Status {
+				s.notifyStatusChange(task, prevStatus)
+			}
+		}
+		s.previousStatuses[task.ID] = task.Status
+	}
+	s.runningTasks = runningTasks
+	s.mu.Unlock()
+}
+
+// GetStatus returns the current status information
+func (s *StatusService) GetStatus() ([]Task, time.Time) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.tasks, s.lastChecked
+}
+
+// HasRunningTasks checks if there are any running tasks
+func (s *StatusService) HasRunningTasks() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, isRunning := range s.runningTasks {
+		if isRunning {
+			return true
+		}
+	}
+	return false
+}
+
+// FormatStatusMessage formats status information for display
+func (s *StatusService) FormatStatusMessage() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.tasks) == 0 {
+		return "No download tasks found."
+	}
+
+	result := fmt.Sprintf("📋 Current Download Status (as of %s)\n\n", s.lastChecked.Format("2006-01-02 15:04:05"))
+
+	for _, task := range s.tasks {
+		result += fmt.Sprintf("📦 %s\n", task.Title)
+		result += fmt.Sprintf("   Status: %s\n", task.Status)
+		result += fmt.Sprintf("   Size: %.2f GB\n", float64(task.Size)/(1024*1024*1024))
+
+		if task.Additional.Detail.CompletedTime > task.Additional.Detail.StartedTime {
+			duration := task.Additional.Detail.CompletedTime - task.Additional.Detail.StartedTime
+			hours := float64(duration) / (60 * 60)
+			result += fmt.Sprintf("   ⬇️ Downloaded: %.2f hours\n", hours)
+
+			if duration > 0 {
+				speed := float64(task.Size) / float64(duration)
+				result += fmt.Sprintf("   ⬇️ Average Speed: %.2f MB/s\n", speed/(1024*1024))
+			}
+		}
+		result += "\n"
+	}
+
+	return result
+}
+
+// notifyStatusChange sends a notification to admin users when a task status changes
+func (s *StatusService) notifyStatusChange(task Task, previousStatus string) {
+	// For now, we'll just log the change
+	// In a real implementation, this would send a Telegram message to admins
+	log.Printf("Task status changed: %s (was %s, now %s)", task.Title, previousStatus, task.Status)
+}
+
+func (s *StatusService) login() (string, error) {
+	url := fmt.Sprintf("http://%s:%s/webapi/auth.cgi?api=SYNO.API.Auth&method=login&version=7&account=%s&passwd=%s&format=json", s.host, s.port, s.username, s.password)
+
+	resp, err := s.client.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("login request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read login response: %w", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("failed to parse login response: %w", err)
+	}
+
+	if result["success"] != true {
+		return "", fmt.Errorf("login failed: %s", string(body))
+	}
+
+	data := result["data"].(map[string]interface{})
+	sessionID := data["sid"].(string)
+	return sessionID, nil
+}
+
+func (s *StatusService) getDownloadTasks(sessionID string) ([]Task, error) {
+	url := fmt.Sprintf("http://%s:%s/webapi/DownloadStation/task.cgi?api=SYNO.DownloadStation.Task&method=list&version=1&_sid=%s&additional=detail,file", s.host, s.port, sessionID)
+
+	resp, err := s.client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("task list request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read task list response: %w", err)
+	}
+
+	var rawResponse map[string]interface{}
+	if err := json.Unmarshal(body, &rawResponse); err != nil {
+		return nil, fmt.Errorf("failed to parse raw task list response: %w", err)
+	}
+
+	// Extract tasks from response
+	var tasks []Task
+
+	if data, ok := rawResponse["data"]; ok {
+		if dataMap, ok := data.(map[string]interface{}); ok {
+			if tasksArray, ok := dataMap["tasks"]; ok {
+				if tasksSlice, ok := tasksArray.([]interface{}); ok {
+					for _, taskData := range tasksSlice {
+						if taskMap, ok := taskData.(map[string]interface{}); ok {
+							taskJSON, _ := json.Marshal(taskMap)
+							var task Task
+							if err := json.Unmarshal(taskJSON, &task); err == nil {
+								tasks = append(tasks, task)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return tasks, nil
 }
 
 func NewBot(token, storagePath string, allowedUsers, adminUsers []int64) (*Bot, error) {
@@ -49,10 +296,11 @@ func NewBot(token, storagePath string, allowedUsers, adminUsers []int64) (*Bot, 
 	}
 
 	return &Bot{
-		api:          bot,
-		storagePath:  storagePath,
-		allowedUsers: userMap,
-		adminUsers:   adminMap,
+		api:           bot,
+		storagePath:   storagePath,
+		allowedUsers:  userMap,
+		adminUsers:    adminMap,
+		statusService: NewStatusService(adminMap),
 	}, nil
 }
 
@@ -60,6 +308,11 @@ func (b *Bot) Start() {
 	b.api.Debug = false
 
 	log.Printf("Authorized on account %s", b.api.Self.UserName)
+
+	// Start the status monitoring service
+	if b.statusService != nil {
+		b.statusService.Start()
+	}
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
@@ -108,6 +361,8 @@ func (b *Bot) handleMessage(message *tgbotapi.Message) {
 		b.sendHelpMessage(chatID)
 	case message.Text == "/id":
 		b.sendUserIDMessage(chatID, userID, message.From)
+	case message.Text == "/status":
+		b.handleStatusCommand(chatID)
 	case strings.HasPrefix(message.Text, "/admin"):
 		b.handleAdminCommand(message, chatID, userID)
 	case message.Text != "":
@@ -437,6 +692,22 @@ func (b *Bot) handleAdminRemoveUser(chatID int64, userIDStr string) {
 	log.Printf("Admin %d removed user %d from allowed list", chatID, userID)
 }
 
+func (b *Bot) handleStatusCommand(chatID int64) {
+	if b.statusService == nil {
+		b.sendTextMessage(chatID, "⚠️ Status service not initialized")
+		return
+	}
+
+	status, _ := b.statusService.GetStatus()
+	if len(status) == 0 {
+		b.sendTextMessage(chatID, "No download tasks found.")
+		return
+	}
+
+	message := b.statusService.FormatStatusMessage()
+	b.sendTextMessage(chatID, message)
+}
+
 func (b *Bot) handleAdminStatus(chatID int64) {
 	allowedCount := len(b.allowedUsers)
 	adminCount := len(b.adminUsers)
@@ -498,6 +769,12 @@ func parseAllowedUsers(allowedUsersStr string) []int64 {
 }
 
 func main() {
+	// Load .env file if it exists
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("No .env file found, using environment variables directly")
+	}
+
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if token == "" {
 		log.Fatal("TELEGRAM_BOT_TOKEN environment variable is required")

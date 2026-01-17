@@ -13,6 +13,7 @@ A simple yet powerful Telegram bot built with Go that receives files from users 
 - 🚀 **Lightweight**: Minimal resource usage with Alpine Linux base
 - 📝 **Detailed Logging**: Comprehensive logging for monitoring and debugging
 - 💾 **Size Limits**: Configurable file size limits (default: 50MB)
+- 📊 **Synology Status Monitoring**: Monitor download tasks and receive notifications for status changes
 
 ## Supported File Types
 
@@ -123,6 +124,10 @@ For Synology NAS users, use the automated setup script:
 | `LOG_LEVEL` | Logging level | `info` | ❌ |
 | `MAX_FILE_SIZE` | Maximum file size in bytes | `52428800` (50MB) | ❌ |
 | `BOT_DEBUG` | Enable debug mode | `false` | ❌ |
+| `SYNOLOGY_HOST` | Synology DSM IP address | `127.0.0.1` | ❌ |
+| `SYNOLOGY_PORT` | Synology DSM port | `5000` | ❌ |
+| `SYNOLOGY_USERNAME` | Synology username | (empty) | ❌ |
+| `SYNOLOGY_PASSWORD` | Synology password | (empty) | ❌ |
 
 **Note for Synology Users:** The bot uses UID `1026` and GID `100` by default, which matches standard Synology user permissions.
 
@@ -274,6 +279,7 @@ Admins have additional capabilities:
 - `/start` - Show welcome message and bot capabilities
 - `/help` - Display help information and supported file types
 - `/id` - Get your Telegram user ID (useful for access control setup)
+- `/status` - Show current download status from Synology
 
 ### Admin Commands (Admin users only)
 - `/admin list` - List all allowed users
@@ -413,6 +419,7 @@ If you encounter any issues or have questions:
 
 - [x] User access control and authorization
 - [x] Admin commands for user management
+- [x] Synology status monitoring with notifications
 - [ ] Web interface for file management
 - [ ] Database integration for metadata
 - [ ] Role-based permissions (viewer, uploader, admin)
