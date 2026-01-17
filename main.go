@@ -55,6 +55,7 @@ type StatusService struct {
 	username         string
 	password         string
 	adminUsers       map[int64]bool
+	botAPI           *tgbotapi.BotAPI
 }
 
 type Bot struct {
@@ -66,7 +67,7 @@ type Bot struct {
 }
 
 // NewStatusService creates a new status service
-func NewStatusService(adminUsers map[int64]bool) *StatusService {
+func NewStatusService(adminUsers map[int64]bool, botAPI *tgbotapi.BotAPI) *StatusService {
 	host := os.Getenv("SYNOLOGY_HOST")
 	if host == "" {
 		host = "192.168.1.34"
@@ -94,6 +95,7 @@ func NewStatusService(adminUsers map[int64]bool) *StatusService {
 		username:         username,
 		password:         password,
 		adminUsers:       adminUsers,
+		botAPI:           botAPI,
 		runningTasks:     make(map[string]bool),
 		previousStatuses: make(map[string]string),
 	}
@@ -197,9 +199,22 @@ func (s *StatusService) FormatStatusMessage() string {
 
 // notifyStatusChange sends a notification to admin users when a task status changes
 func (s *StatusService) notifyStatusChange(task Task, previousStatus string) {
-	// For now, we'll just log the change
-	// In a real implementation, this would send a Telegram message to admins
+	// Log the change
 	log.Printf("Task status changed: %s (was %s, now %s)", task.Title, previousStatus, task.Status)
+
+	// Send notification to all admin users (if bot API is available)
+	if s.botAPI != nil {
+		message := fmt.Sprintf("🔔 Status Change Alert:\n\nTask: %s\nPrevious Status: %s\nNew Status: %s\n\nLast updated: %s",
+			task.Title, previousStatus, task.Status, time.Now().Format("2006-01-02 15:04:05"))
+
+		for userID := range s.adminUsers {
+			msg := tgbotapi.NewMessage(userID, message)
+			_, err := s.botAPI.Send(msg)
+			if err != nil {
+				log.Printf("Failed to send status change notification to user %d: %v", userID, err)
+			}
+		}
+	}
 }
 
 func (s *StatusService) login() (string, error) {
@@ -300,7 +315,7 @@ func NewBot(token, storagePath string, allowedUsers, adminUsers []int64) (*Bot, 
 		storagePath:   storagePath,
 		allowedUsers:  userMap,
 		adminUsers:    adminMap,
-		statusService: NewStatusService(adminMap),
+		statusService: NewStatusService(adminMap, bot),
 	}, nil
 }
 
