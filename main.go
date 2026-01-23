@@ -44,18 +44,19 @@ type Task struct {
 
 // StatusService manages the status monitoring
 type StatusService struct {
-	mu               sync.RWMutex
-	tasks            []Task
-	lastChecked      time.Time
-	runningTasks     map[string]bool
-	previousStatuses map[string]string
-	client           *http.Client
-	host             string
-	port             string
-	username         string
-	password         string
-	adminUsers       map[int64]bool
-	botAPI           *tgbotapi.BotAPI
+	mu                 sync.RWMutex
+	tasks              []Task
+	lastChecked        time.Time
+	runningTasks       map[string]bool
+	previousStatuses   map[string]string
+	client             *http.Client
+	host               string
+	port               string
+	username           string
+	password           string
+	adminUsers         map[int64]bool
+	botAPI             *tgbotapi.BotAPI
+	statusUpdateTicker *time.Ticker
 }
 
 type Bot struct {
@@ -89,26 +90,50 @@ func NewStatusService(adminUsers map[int64]bool, botAPI *tgbotapi.BotAPI) *Statu
 	}
 
 	return &StatusService{
-		client:           &http.Client{Timeout: 30 * time.Second},
-		host:             host,
-		port:             port,
-		username:         username,
-		password:         password,
-		adminUsers:       adminUsers,
-		botAPI:           botAPI,
-		runningTasks:     make(map[string]bool),
-		previousStatuses: make(map[string]string),
+		client:             &http.Client{Timeout: 30 * time.Second},
+		host:               host,
+		port:               port,
+		username:           username,
+		password:           password,
+		adminUsers:         adminUsers,
+		botAPI:             botAPI,
+		runningTasks:       make(map[string]bool),
+		previousStatuses:   make(map[string]string),
+		statusUpdateTicker: time.NewTicker(1 * time.Minute),
 	}
 }
 
 // Start begins the status monitoring loop
 func (s *StatusService) Start() {
 	go func() {
+		// Initial status check
+		s.checkStatus()
+		
 		for {
-			s.checkStatus()
-			time.Sleep(5 * time.Minute)
+			// Only check ticker if it's still active and there are running tasks (any status except finished)
+			if s.statusUpdateTicker != nil && s.HasRunningTasks() {
+				select {
+				case <-s.statusUpdateTicker.C:
+					s.checkStatus()
+				}
+			} else if s.statusUpdateTicker != nil && !s.HasRunningTasks() {
+				// If no running tasks but ticker still exists, stop it
+				s.statusUpdateTicker.Stop()
+				s.statusUpdateTicker = nil
+				log.Println("All tasks finished, stopping status updates")
+			} else {
+				// If ticker is nil, sleep briefly to avoid busy waiting
+				time.Sleep(1 * time.Second)
+			}
 		}
 	}()
+}
+
+// Stop stops the status monitoring
+func (s *StatusService) Stop() {
+	if s.statusUpdateTicker != nil {
+		s.statusUpdateTicker.Stop()
+	}
 }
 
 // checkStatus fetches and processes the current status
@@ -129,10 +154,20 @@ func (s *StatusService) checkStatus() {
 	s.tasks = tasks
 	s.lastChecked = time.Now()
 
+	// Check if all tasks are finished (only 'finished' status means complete)
+	allFinished := true
+	for _, task := range tasks {
+		if task.Status != "finished" {
+			allFinished = false
+			break
+		}
+	}
+
 	// Update running tasks and detect changes
 	runningTasks := make(map[string]bool)
 	for _, task := range tasks {
-		runningTasks[task.ID] = task.Status == "running"
+		// Mark as running if it's not finished (handles any active state)
+		runningTasks[task.ID] = task.Status != "finished"
 
 		// Check for status changes
 		if prevStatus, exists := s.previousStatuses[task.ID]; exists {
@@ -144,6 +179,19 @@ func (s *StatusService) checkStatus() {
 	}
 	s.runningTasks = runningTasks
 	s.mu.Unlock()
+
+	// If all tasks are finished, stop the ticker
+	if allFinished && s.statusUpdateTicker != nil {
+		s.statusUpdateTicker.Stop()
+		s.statusUpdateTicker = nil
+		log.Println("All tasks finished, stopping status updates")
+	}
+	// If there are running tasks (any status except finished) but ticker is nil, restart it
+	// This handles the case where we had all finished tasks, then new tasks arrived
+	if !allFinished && s.statusUpdateTicker == nil {
+		s.statusUpdateTicker = time.NewTicker(1 * time.Minute)
+		log.Println("New tasks detected, restarting status updates")
+	}
 }
 
 // GetStatus returns the current status information
@@ -157,8 +205,8 @@ func (s *StatusService) GetStatus() ([]Task, time.Time) {
 func (s *StatusService) HasRunningTasks() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, isRunning := range s.runningTasks {
-		if isRunning {
+	for _, task := range s.tasks {
+		if task.Status != "finished" {
 			return true
 		}
 	}
@@ -404,6 +452,9 @@ func (b *Bot) handleDocument(document *tgbotapi.Document, chatID int64, messageI
 		return
 	}
 
+	// Force status update when file is received
+	b.forceStatusUpdate(chatID)
+
 	b.sendTextMessage(chatID, fmt.Sprintf("✅ '%s'", fileName))
 }
 
@@ -415,6 +466,9 @@ func (b *Bot) handlePhoto(photo *tgbotapi.PhotoSize, chatID int64, messageID int
 		b.sendTextMessage(chatID, "Failed to save the photo.")
 		return
 	}
+
+	// Force status update when file is received
+	b.forceStatusUpdate(chatID)
 
 	b.sendTextMessage(chatID, fmt.Sprintf("✅ Photo '%s' saved successfully!", fileName))
 }
@@ -432,6 +486,9 @@ func (b *Bot) handleVideo(video *tgbotapi.Video, chatID int64, messageID int) {
 		b.sendTextMessage(chatID, "Failed to save the video.")
 		return
 	}
+
+	// Force status update when file is received
+	b.forceStatusUpdate(chatID)
 
 	b.sendTextMessage(chatID, fmt.Sprintf("✅ Video '%s' saved successfully!", fileName))
 }
@@ -453,6 +510,9 @@ func (b *Bot) handleAudio(audio *tgbotapi.Audio, chatID int64, messageID int) {
 		return
 	}
 
+	// Force status update when file is received
+	b.forceStatusUpdate(chatID)
+
 	b.sendTextMessage(chatID, fmt.Sprintf("✅ Audio '%s' saved successfully!", fileName))
 }
 
@@ -464,6 +524,9 @@ func (b *Bot) handleVoice(voice *tgbotapi.Voice, chatID int64, messageID int) {
 		b.sendTextMessage(chatID, "Failed to save the voice message.")
 		return
 	}
+
+	// Force status update when file is received
+	b.forceStatusUpdate(chatID)
 
 	b.sendTextMessage(chatID, fmt.Sprintf("✅ Voice message '%s' saved successfully!", fileName))
 }
@@ -477,6 +540,9 @@ func (b *Bot) handleVideoNote(videoNote *tgbotapi.VideoNote, chatID int64, messa
 		return
 	}
 
+	// Force status update when file is received
+	b.forceStatusUpdate(chatID)
+
 	b.sendTextMessage(chatID, fmt.Sprintf("✅ Video note '%s' saved successfully!", fileName))
 }
 
@@ -488,6 +554,9 @@ func (b *Bot) handleSticker(sticker *tgbotapi.Sticker, chatID int64, messageID i
 		b.sendTextMessage(chatID, "Failed to save the sticker.")
 		return
 	}
+
+	// Force status update when file is received
+	b.forceStatusUpdate(chatID)
 
 	b.sendTextMessage(chatID, fmt.Sprintf("✅ Sticker '%s' saved successfully!", fileName))
 }
@@ -723,6 +792,26 @@ func (b *Bot) handleStatusCommand(chatID int64) {
 	b.sendTextMessage(chatID, message)
 }
 
+// forceStatusUpdate forces an immediate status update
+func (b *Bot) forceStatusUpdate(chatID int64) {
+	if b.statusService == nil {
+		return
+	}
+
+	// Trigger immediate status check
+	b.statusService.checkStatus()
+
+	// Send current status to user
+	status, _ := b.statusService.GetStatus()
+	if len(status) == 0 {
+		b.sendTextMessage(chatID, "No download tasks found.")
+		return
+	}
+
+	message := b.statusService.FormatStatusMessage()
+	b.sendTextMessage(chatID, message)
+}
+
 func (b *Bot) handleAdminStatus(chatID int64) {
 	allowedCount := len(b.allowedUsers)
 	adminCount := len(b.adminUsers)
@@ -826,5 +915,13 @@ func main() {
 	}
 
 	log.Printf("Bot started successfully. Storage path: %s", storagePath)
+
+	// Ensure cleanup of resources on exit
+	defer func() {
+		if bot.statusService != nil {
+			bot.statusService.Stop()
+		}
+	}()
+
 	bot.Start()
 }
