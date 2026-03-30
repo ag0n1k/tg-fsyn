@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -10,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -18,8 +16,9 @@ import (
 )
 
 const (
-	DefaultStoragePath = "./files"
-	MaxFileSize        = 50 * 1024 * 1024 // 50MB
+	DefaultStoragePath     = "./files"
+	MaxFileSize            = 50 * 1024 * 1024 // 50MB
+	StatusUpdateInterval   = 5 * time.Minute
 )
 
 // Task represents a download task
@@ -42,298 +41,12 @@ type Task struct {
 	} `json:"additional"`
 }
 
-// StatusService manages the status monitoring
-type StatusService struct {
-	mu                 sync.RWMutex
-	tasks              []Task
-	lastChecked        time.Time
-	runningTasks       map[string]bool
-	previousStatuses   map[string]string
-	client             *http.Client
-	host               string
-	port               string
-	username           string
-	password           string
-	adminUsers         map[int64]bool
-	botAPI             *tgbotapi.BotAPI
-	statusUpdateTicker *time.Ticker
-}
-
 type Bot struct {
 	api           *tgbotapi.BotAPI
 	storagePath   string
 	allowedUsers  map[int64]bool
 	adminUsers    map[int64]bool
 	statusService *StatusService
-}
-
-// NewStatusService creates a new status service
-func NewStatusService(adminUsers map[int64]bool, botAPI *tgbotapi.BotAPI) *StatusService {
-	host := os.Getenv("SYNOLOGY_HOST")
-	if host == "" {
-		host = "192.168.1.34"
-	}
-
-	port := os.Getenv("SYNOLOGY_PORT")
-	if port == "" {
-		port = "5000"
-	}
-
-	username := os.Getenv("SYNOLOGY_USERNAME")
-	if username == "" {
-		log.Fatal("SYNOLOGY_USERNAME environment variable is required")
-	}
-
-	password := os.Getenv("SYNOLOGY_PASSWORD")
-	if password == "" {
-		log.Fatal("SYNOLOGY_PASSWORD environment variable is required")
-	}
-
-	return &StatusService{
-		client:             &http.Client{Timeout: 30 * time.Second},
-		host:               host,
-		port:               port,
-		username:           username,
-		password:           password,
-		adminUsers:         adminUsers,
-		botAPI:             botAPI,
-		runningTasks:       make(map[string]bool),
-		previousStatuses:   make(map[string]string),
-		statusUpdateTicker: time.NewTicker(1 * time.Minute),
-	}
-}
-
-// Start begins the status monitoring loop
-func (s *StatusService) Start() {
-	go func() {
-		// Initial status check
-		s.checkStatus()
-		
-		for {
-			// Only check ticker if it's still active and there are running tasks (any status except finished)
-			if s.statusUpdateTicker != nil && s.HasRunningTasks() {
-				select {
-				case <-s.statusUpdateTicker.C:
-					s.checkStatus()
-				}
-			} else if s.statusUpdateTicker != nil && !s.HasRunningTasks() {
-				// If no running tasks but ticker still exists, stop it
-				s.statusUpdateTicker.Stop()
-				s.statusUpdateTicker = nil
-				log.Println("All tasks finished, stopping status updates")
-			} else {
-				// If ticker is nil, sleep briefly to avoid busy waiting
-				time.Sleep(1 * time.Second)
-			}
-		}
-	}()
-}
-
-// Stop stops the status monitoring
-func (s *StatusService) Stop() {
-	if s.statusUpdateTicker != nil {
-		s.statusUpdateTicker.Stop()
-	}
-}
-
-// checkStatus fetches and processes the current status
-func (s *StatusService) checkStatus() {
-	sessionID, err := s.login()
-	if err != nil {
-		log.Printf("Login failed: %v", err)
-		return
-	}
-
-	tasks, err := s.getDownloadTasks(sessionID)
-	if err != nil {
-		log.Printf("Failed to get tasks: %v", err)
-		return
-	}
-
-	s.mu.Lock()
-	s.tasks = tasks
-	s.lastChecked = time.Now()
-
-	// Check if all tasks are finished (only 'finished' status means complete)
-	allFinished := true
-	for _, task := range tasks {
-		if task.Status != "finished" {
-			allFinished = false
-			break
-		}
-	}
-
-	// Update running tasks and detect changes
-	runningTasks := make(map[string]bool)
-	for _, task := range tasks {
-		// Mark as running if it's not finished (handles any active state)
-		runningTasks[task.ID] = task.Status != "finished"
-
-		// Check for status changes
-		if prevStatus, exists := s.previousStatuses[task.ID]; exists {
-			if prevStatus != task.Status {
-				s.notifyStatusChange(task, prevStatus)
-			}
-		}
-		s.previousStatuses[task.ID] = task.Status
-	}
-	s.runningTasks = runningTasks
-	s.mu.Unlock()
-
-	// If all tasks are finished, stop the ticker
-	if allFinished && s.statusUpdateTicker != nil {
-		s.statusUpdateTicker.Stop()
-		s.statusUpdateTicker = nil
-		log.Println("All tasks finished, stopping status updates")
-	}
-	// If there are running tasks (any status except finished) but ticker is nil, restart it
-	// This handles the case where we had all finished tasks, then new tasks arrived
-	if !allFinished && s.statusUpdateTicker == nil {
-		s.statusUpdateTicker = time.NewTicker(1 * time.Minute)
-		log.Println("New tasks detected, restarting status updates")
-	}
-}
-
-// GetStatus returns the current status information
-func (s *StatusService) GetStatus() ([]Task, time.Time) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.tasks, s.lastChecked
-}
-
-// HasRunningTasks checks if there are any running tasks
-func (s *StatusService) HasRunningTasks() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, task := range s.tasks {
-		if task.Status != "finished" {
-			return true
-		}
-	}
-	return false
-}
-
-// FormatStatusMessage formats status information for display
-func (s *StatusService) FormatStatusMessage() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if len(s.tasks) == 0 {
-		return "No download tasks found."
-	}
-
-	result := fmt.Sprintf("📋 Current Download Status (as of %s)\n\n", s.lastChecked.Format("2006-01-02 15:04:05"))
-
-	for _, task := range s.tasks {
-		result += fmt.Sprintf("📦 %s\n", task.Title)
-		result += fmt.Sprintf("   Status: %s\n", task.Status)
-		result += fmt.Sprintf("   Size: %.2f GB\n", float64(task.Size)/(1024*1024*1024))
-
-		if task.Additional.Detail.CompletedTime > task.Additional.Detail.StartedTime {
-			duration := task.Additional.Detail.CompletedTime - task.Additional.Detail.StartedTime
-			hours := float64(duration) / (60 * 60)
-			result += fmt.Sprintf("   ⬇️ Downloaded: %.2f hours\n", hours)
-
-			if duration > 0 {
-				speed := float64(task.Size) / float64(duration)
-				result += fmt.Sprintf("   ⬇️ Average Speed: %.2f MB/s\n", speed/(1024*1024))
-			}
-		}
-		result += "\n"
-	}
-
-	return result
-}
-
-// notifyStatusChange sends a notification to admin users when a task status changes
-func (s *StatusService) notifyStatusChange(task Task, previousStatus string) {
-	// Log the change
-	log.Printf("Task status changed: %s (was %s, now %s)", task.Title, previousStatus, task.Status)
-
-	// Send notification to all admin users (if bot API is available)
-	if s.botAPI != nil {
-		message := fmt.Sprintf("🔔 Status Change Alert:\n\nTask: %s\nPrevious Status: %s\nNew Status: %s\n\nLast updated: %s",
-			task.Title, previousStatus, task.Status, time.Now().Format("2006-01-02 15:04:05"))
-
-		for userID := range s.adminUsers {
-			msg := tgbotapi.NewMessage(userID, message)
-			_, err := s.botAPI.Send(msg)
-			if err != nil {
-				log.Printf("Failed to send status change notification to user %d: %v", userID, err)
-			}
-		}
-	}
-}
-
-func (s *StatusService) login() (string, error) {
-	url := fmt.Sprintf("http://%s:%s/webapi/auth.cgi?api=SYNO.API.Auth&method=login&version=7&account=%s&passwd=%s&format=json", s.host, s.port, s.username, s.password)
-
-	resp, err := s.client.Get(url)
-	if err != nil {
-		return "", fmt.Errorf("login request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read login response: %w", err)
-	}
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("failed to parse login response: %w", err)
-	}
-
-	if result["success"] != true {
-		return "", fmt.Errorf("login failed: %s", string(body))
-	}
-
-	data := result["data"].(map[string]interface{})
-	sessionID := data["sid"].(string)
-	return sessionID, nil
-}
-
-func (s *StatusService) getDownloadTasks(sessionID string) ([]Task, error) {
-	url := fmt.Sprintf("http://%s:%s/webapi/DownloadStation/task.cgi?api=SYNO.DownloadStation.Task&method=list&version=1&_sid=%s&additional=detail,file", s.host, s.port, sessionID)
-
-	resp, err := s.client.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("task list request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read task list response: %w", err)
-	}
-
-	var rawResponse map[string]interface{}
-	if err := json.Unmarshal(body, &rawResponse); err != nil {
-		return nil, fmt.Errorf("failed to parse raw task list response: %w", err)
-	}
-
-	// Extract tasks from response
-	var tasks []Task
-
-	if data, ok := rawResponse["data"]; ok {
-		if dataMap, ok := data.(map[string]interface{}); ok {
-			if tasksArray, ok := dataMap["tasks"]; ok {
-				if tasksSlice, ok := tasksArray.([]interface{}); ok {
-					for _, taskData := range tasksSlice {
-						if taskMap, ok := taskData.(map[string]interface{}); ok {
-							taskJSON, _ := json.Marshal(taskMap)
-							var task Task
-							if err := json.Unmarshal(taskJSON, &task); err == nil {
-								tasks = append(tasks, task)
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return tasks, nil
 }
 
 func NewBot(token, storagePath string, allowedUsers, adminUsers []int64) (*Bot, error) {
@@ -358,12 +71,36 @@ func NewBot(token, storagePath string, allowedUsers, adminUsers []int64) (*Bot, 
 		adminMap[userID] = true
 	}
 
+	// Build Synology client from environment
+	host := os.Getenv("SYNOLOGY_HOST")
+	if host == "" {
+		host = "192.168.1.34"
+	}
+
+	port := os.Getenv("SYNOLOGY_PORT")
+	if port == "" {
+		port = "5000"
+	}
+
+	username := os.Getenv("SYNOLOGY_USERNAME")
+	if username == "" {
+		log.Fatal("SYNOLOGY_USERNAME environment variable is required")
+	}
+
+	password := os.Getenv("SYNOLOGY_PASSWORD")
+	if password == "" {
+		log.Fatal("SYNOLOGY_PASSWORD environment variable is required")
+	}
+
+	synClient := NewSynologyHTTPClient(host, port, username, password)
+	statusSvc := NewStatusService(synClient, adminMap, bot, StatusUpdateInterval)
+
 	return &Bot{
 		api:           bot,
 		storagePath:   storagePath,
 		allowedUsers:  userMap,
 		adminUsers:    adminMap,
-		statusService: NewStatusService(adminMap, bot),
+		statusService: statusSvc,
 	}, nil
 }
 
