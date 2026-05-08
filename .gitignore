@@ -19,6 +19,8 @@ go.work
 
 # Build artifacts
 main
+tg-fsyn
+tg-fsyn-*
 dist/
 build/
 

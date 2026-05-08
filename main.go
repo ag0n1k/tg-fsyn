@@ -16,9 +16,11 @@ import (
 )
 
 const (
-	DefaultStoragePath     = "./files"
-	MaxFileSize            = 50 * 1024 * 1024 // 50MB
-	StatusUpdateInterval   = 5 * time.Minute
+	DefaultStoragePath   = "./files"
+	MaxFileSize          = 50 * 1024 * 1024 // 50MB
+	StatusUpdateInterval = 5 * time.Minute
+	RecentFinishedWindow = 24 * time.Hour
+	ReindexCallbackData  = "reindex"
 )
 
 // Task represents a download task
@@ -47,6 +49,7 @@ type Bot struct {
 	allowedUsers  map[int64]bool
 	adminUsers    map[int64]bool
 	statusService *StatusService
+	reindexer     Reindexer
 }
 
 func NewBot(token, storagePath string, allowedUsers, adminUsers []int64) (*Bot, error) {
@@ -95,13 +98,42 @@ func NewBot(token, storagePath string, allowedUsers, adminUsers []int64) (*Bot, 
 	synClient := NewSynologyHTTPClient(host, port, username, password)
 	statusSvc := NewStatusService(synClient, adminMap, bot, StatusUpdateInterval)
 
+	var reindexer Reindexer
+	synoindexBin := os.Getenv("SYNOINDEX_BIN")
+	if synoindexBin == "" {
+		synoindexBin = "/usr/syno/bin/synoindex"
+	}
+	reindexPaths := parseReindexPaths(os.Getenv("REINDEX_PATHS"))
+	if _, err := os.Stat(synoindexBin); err == nil {
+		reindexer = NewSynoindexRunner(synoindexBin, reindexPaths)
+		log.Printf("Reindex enabled: bin=%s, paths=%v", synoindexBin, reindexPaths)
+	} else {
+		log.Printf("Reindex disabled: %s not found", synoindexBin)
+	}
+
 	return &Bot{
 		api:           bot,
 		storagePath:   storagePath,
 		allowedUsers:  userMap,
 		adminUsers:    adminMap,
 		statusService: statusSvc,
+		reindexer:     reindexer,
 	}, nil
+}
+
+func parseReindexPaths(s string) []string {
+	if s == "" {
+		return []string{"/volume1/video"}
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (b *Bot) Start() {
@@ -122,6 +154,9 @@ func (b *Bot) Start() {
 	for update := range updates {
 		if update.Message != nil {
 			b.handleMessage(update.Message)
+		}
+		if update.CallbackQuery != nil {
+			b.handleCallback(update.CallbackQuery)
 		}
 	}
 }
@@ -163,6 +198,8 @@ func (b *Bot) handleMessage(message *tgbotapi.Message) {
 		b.sendUserIDMessage(chatID, userID, message.From)
 	case message.Text == "/status":
 		b.handleStatusCommand(chatID)
+	case message.Text == "/reindex":
+		b.handleReindexCommand(chatID)
 	case strings.HasPrefix(message.Text, "/admin"):
 		b.handleAdminCommand(message, chatID, userID)
 	case message.Text != "":
@@ -356,7 +393,9 @@ func (b *Bot) sendHelpMessage(chatID int64) {
 
 /start - Show welcome message
 /help - Show this help message
-/id - Show your Telegram user ID`
+/id - Show your Telegram user ID
+/status - Show current download tasks
+/reindex - Reindex media library on the NAS`
 
 	// Add admin commands if user is admin
 	if b.isUserAdmin(chatID) {
@@ -527,6 +566,84 @@ func (b *Bot) handleStatusCommand(chatID int64) {
 
 	message := b.statusService.FormatStatusMessage()
 	b.sendTextMessage(chatID, message)
+}
+
+func (b *Bot) handleReindexCommand(chatID int64) {
+	if b.reindexer == nil {
+		b.sendTextMessage(chatID, "⚠️ Reindex is not available (synoindex binary not found).")
+		return
+	}
+
+	var body string
+	if b.statusService != nil {
+		recent := b.statusService.RecentFinishedTasks(RecentFinishedWindow)
+		if len(recent) == 0 {
+			body = "No tasks finished in the last 24 hours."
+		} else {
+			body = fmt.Sprintf("✅ Finished in the last 24h (%d):\n\n", len(recent))
+			for i, t := range recent {
+				if i >= 15 {
+					body += fmt.Sprintf("…and %d more\n", len(recent)-i)
+					break
+				}
+				body += fmt.Sprintf("• %s\n", t.Title)
+			}
+			body += "\n"
+		}
+	}
+	body += "Tap the button to reindex the media library."
+
+	msg := tgbotapi.NewMessage(chatID, body)
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Reindex media", ReindexCallbackData),
+		),
+	)
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Failed to send /reindex message: %v", err)
+	}
+}
+
+func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
+	if cb.From == nil || !b.isUserAllowed(cb.From.ID) {
+		ack := tgbotapi.NewCallback(cb.ID, "Not authorized")
+		_, _ = b.api.Request(ack)
+		return
+	}
+
+	switch cb.Data {
+	case ReindexCallbackData:
+		b.handleReindexCallback(cb)
+	default:
+		ack := tgbotapi.NewCallback(cb.ID, "Unknown action")
+		_, _ = b.api.Request(ack)
+	}
+}
+
+func (b *Bot) handleReindexCallback(cb *tgbotapi.CallbackQuery) {
+	chatID := cb.Message.Chat.ID
+
+	if b.reindexer == nil {
+		ack := tgbotapi.NewCallback(cb.ID, "Reindex not configured")
+		_, _ = b.api.Request(ack)
+		return
+	}
+
+	ack := tgbotapi.NewCallback(cb.ID, "Reindexing…")
+	if _, err := b.api.Request(ack); err != nil {
+		log.Printf("Failed to ack callback: %v", err)
+	}
+
+	indexed, err := b.reindexer.Reindex()
+	if err != nil {
+		log.Printf("Reindex failed: %v", err)
+		b.sendTextMessage(chatID, fmt.Sprintf("❌ Reindex failed: %v", err))
+		return
+	}
+	if indexed == "" {
+		indexed = "media library"
+	}
+	b.sendTextMessage(chatID, fmt.Sprintf("✅ Reindex triggered: %s", indexed))
 }
 
 // forceStatusUpdate forces an immediate status update

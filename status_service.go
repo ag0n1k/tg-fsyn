@@ -108,6 +108,32 @@ func (s *StatusService) HasRunningTasks() bool {
 	return false
 }
 
+// RecentFinishedTasks returns finished tasks completed within the given duration,
+// sorted by completed_time descending (most recent first).
+func (s *StatusService) RecentFinishedTasks(within time.Duration) []Task {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	cutoff := time.Now().Add(-within).Unix()
+	var out []Task
+	for _, task := range s.tasks {
+		if task.Status != "finished" {
+			continue
+		}
+		if task.Additional.Detail.CompletedTime < cutoff {
+			continue
+		}
+		out = append(out, task)
+	}
+
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j].Additional.Detail.CompletedTime > out[j-1].Additional.Detail.CompletedTime; j-- {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
+	}
+	return out
+}
+
 // FormatStatusMessage formats status information for display.
 func (s *StatusService) FormatStatusMessage() string {
 	s.mu.RLock()

@@ -313,6 +313,42 @@ func TestHasRunningTasks(t *testing.T) {
 	}
 }
 
+func TestRecentFinishedTasks(t *testing.T) {
+	now := time.Now().Unix()
+	mkTask := func(id, title, status string, completedAgo time.Duration) Task {
+		var t Task
+		t.ID = id
+		t.Title = title
+		t.Status = status
+		t.Additional.Detail.CompletedTime = now - int64(completedAgo.Seconds())
+		return t
+	}
+
+	client := &mockSynologyClient{
+		tasks: []Task{
+			mkTask("1", "Old finished", "finished", 48*time.Hour),
+			mkTask("2", "Recent finished A", "finished", 2*time.Hour),
+			mkTask("3", "Still downloading", "downloading", 1*time.Hour),
+			mkTask("4", "Recent finished B", "finished", 30*time.Minute),
+			mkTask("5", "Errored recently", "error", 1*time.Hour),
+		},
+	}
+	sender := &mockBotSender{}
+	svc := newTestService(client, sender, time.Hour)
+	svc.checkStatus()
+
+	out := svc.RecentFinishedTasks(24 * time.Hour)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 recent finished tasks, got %d", len(out))
+	}
+	if out[0].ID != "4" {
+		t.Errorf("expected most recent first (id=4), got id=%s", out[0].ID)
+	}
+	if out[1].ID != "2" {
+		t.Errorf("expected id=2 second, got id=%s", out[1].ID)
+	}
+}
+
 func containsString(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }
