@@ -134,6 +134,46 @@ func (s *StatusService) RecentFinishedTasks(within time.Duration) []Task {
 	return out
 }
 
+// FinishedTasks returns a snapshot of currently-cached finished tasks.
+func (s *StatusService) FinishedTasks() []Task {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []Task
+	for _, task := range s.tasks {
+		if task.Status == "finished" {
+			out = append(out, task)
+		}
+	}
+	return out
+}
+
+// CleanupFinishedTasks deletes all currently-cached finished tasks from
+// DownloadStation and refreshes the cache. Returns the tasks that were
+// attempted to be deleted (so the caller can report titles back to the user).
+func (s *StatusService) CleanupFinishedTasks() ([]Task, error) {
+	s.mu.RLock()
+	var toDelete []Task
+	var ids []string
+	for _, task := range s.tasks {
+		if task.Status == "finished" {
+			toDelete = append(toDelete, task)
+			ids = append(ids, task.ID)
+		}
+	}
+	s.mu.RUnlock()
+
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	if err := s.synology.DeleteTasks(ids); err != nil {
+		return toDelete, err
+	}
+
+	s.checkStatus()
+	return toDelete, nil
+}
+
 // FormatStatusMessage formats status information for display.
 func (s *StatusService) FormatStatusMessage() string {
 	s.mu.RLock()

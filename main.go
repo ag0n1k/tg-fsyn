@@ -21,6 +21,7 @@ const (
 	StatusUpdateInterval = 5 * time.Minute
 	RecentFinishedWindow = 24 * time.Hour
 	ReindexCallbackData  = "reindex"
+	CleanupCallbackData  = "cleanup"
 )
 
 // Task represents a download task
@@ -200,6 +201,8 @@ func (b *Bot) handleMessage(message *tgbotapi.Message) {
 		b.handleStatusCommand(chatID)
 	case message.Text == "/reindex":
 		b.handleReindexCommand(chatID)
+	case message.Text == "/cleanup":
+		b.handleCleanupCommand(chatID)
 	case strings.HasPrefix(message.Text, "/admin"):
 		b.handleAdminCommand(message, chatID, userID)
 	case message.Text != "":
@@ -395,7 +398,8 @@ func (b *Bot) sendHelpMessage(chatID int64) {
 /help - Show this help message
 /id - Show your Telegram user ID
 /status - Show current download tasks
-/reindex - Reindex media library on the NAS`
+/reindex - Reindex media library on the NAS
+/cleanup - Delete finished tasks from DownloadStation`
 
 	// Add admin commands if user is admin
 	if b.isUserAdmin(chatID) {
@@ -614,6 +618,8 @@ func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
 	switch cb.Data {
 	case ReindexCallbackData:
 		b.handleReindexCallback(cb)
+	case CleanupCallbackData:
+		b.handleCleanupCallback(cb)
 	default:
 		ack := tgbotapi.NewCallback(cb.ID, "Unknown action")
 		_, _ = b.api.Request(ack)
@@ -644,6 +650,72 @@ func (b *Bot) handleReindexCallback(cb *tgbotapi.CallbackQuery) {
 		indexed = "media library"
 	}
 	b.sendTextMessage(chatID, fmt.Sprintf("✅ Reindex triggered: %s", indexed))
+}
+
+func (b *Bot) handleCleanupCommand(chatID int64) {
+	if b.statusService == nil {
+		b.sendTextMessage(chatID, "⚠️ Status service not initialized")
+		return
+	}
+
+	finished := b.statusService.FinishedTasks()
+	if len(finished) == 0 {
+		b.sendTextMessage(chatID, "No finished tasks to clean up.")
+		return
+	}
+
+	body := fmt.Sprintf("🗑 Finished tasks to delete (%d):\n\n", len(finished))
+	for i, t := range finished {
+		if i >= 15 {
+			body += fmt.Sprintf("…and %d more\n", len(finished)-i)
+			break
+		}
+		body += fmt.Sprintf("• %s\n", t.Title)
+	}
+	body += "\nFiles on disk are kept — only DownloadStation entries are removed."
+
+	msg := tgbotapi.NewMessage(chatID, body)
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(
+				fmt.Sprintf("🗑 Delete %d finished", len(finished)),
+				CleanupCallbackData,
+			),
+		),
+	)
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Failed to send /cleanup message: %v", err)
+	}
+}
+
+func (b *Bot) handleCleanupCallback(cb *tgbotapi.CallbackQuery) {
+	chatID := cb.Message.Chat.ID
+
+	if b.statusService == nil {
+		ack := tgbotapi.NewCallback(cb.ID, "Status service not available")
+		_, _ = b.api.Request(ack)
+		return
+	}
+
+	deleted, err := b.statusService.CleanupFinishedTasks()
+	if err != nil {
+		log.Printf("Cleanup failed: %v", err)
+		ack := tgbotapi.NewCallback(cb.ID, "Cleanup failed")
+		_, _ = b.api.Request(ack)
+		b.sendTextMessage(chatID, fmt.Sprintf("❌ Cleanup failed: %v", err))
+		return
+	}
+
+	if len(deleted) == 0 {
+		ack := tgbotapi.NewCallback(cb.ID, "Nothing to delete")
+		_, _ = b.api.Request(ack)
+		b.sendTextMessage(chatID, "No finished tasks to clean up.")
+		return
+	}
+
+	ack := tgbotapi.NewCallback(cb.ID, fmt.Sprintf("Deleted %d", len(deleted)))
+	_, _ = b.api.Request(ack)
+	b.sendTextMessage(chatID, fmt.Sprintf("✅ Deleted %d finished task(s).", len(deleted)))
 }
 
 // forceStatusUpdate forces an immediate status update

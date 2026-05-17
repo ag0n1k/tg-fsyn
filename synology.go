@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
-// SynologyClient defines the interface for fetching download tasks.
+// SynologyClient defines the interface for interacting with DownloadStation.
 type SynologyClient interface {
 	FetchTasks() ([]Task, error)
+	DeleteTasks(ids []string) error
 }
 
 // synologyHTTPClient implements SynologyClient using the Synology DownloadStation HTTP API.
@@ -44,6 +47,63 @@ func (c *synologyHTTPClient) FetchTasks() ([]Task, error) {
 	}
 
 	return tasks, nil
+}
+
+// DeleteTasks removes the given task IDs from DownloadStation. The downloaded
+// files on disk are not touched — only the task entries are removed.
+func (c *synologyHTTPClient) DeleteTasks(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	sessionID, err := c.login()
+	if err != nil {
+		return fmt.Errorf("login failed: %w", err)
+	}
+
+	endpoint := fmt.Sprintf(
+		"http://%s:%s/webapi/DownloadStation/task.cgi?api=SYNO.DownloadStation.Task&method=delete&version=1&id=%s&force_complete=false&_sid=%s",
+		c.host, c.port, url.QueryEscape(strings.Join(ids, ",")), sessionID,
+	)
+
+	resp, err := c.client.Get(endpoint)
+	if err != nil {
+		return fmt.Errorf("delete request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read delete response: %w", err)
+	}
+
+	var result struct {
+		Success bool `json:"success"`
+		Data    []struct {
+			ID    string `json:"id"`
+			Error int    `json:"error"`
+		} `json:"data"`
+		Error struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("failed to parse delete response: %w", err)
+	}
+	if !result.Success {
+		return fmt.Errorf("delete failed (code %d)", result.Error.Code)
+	}
+
+	var failed []string
+	for _, r := range result.Data {
+		if r.Error != 0 {
+			failed = append(failed, fmt.Sprintf("%s (code %d)", r.ID, r.Error))
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("some tasks were not deleted: %s", strings.Join(failed, ", "))
+	}
+	return nil
 }
 
 func (c *synologyHTTPClient) login() (string, error) {

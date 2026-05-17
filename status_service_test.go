@@ -11,10 +11,12 @@ import (
 
 // mockSynologyClient implements SynologyClient for testing.
 type mockSynologyClient struct {
-	mu    sync.Mutex
-	tasks []Task
-	err   error
-	calls int32 // atomic
+	mu         sync.Mutex
+	tasks      []Task
+	err        error
+	calls      int32 // atomic
+	deleteErr  error
+	deletedIDs []string
 }
 
 func (m *mockSynologyClient) FetchTasks() ([]Task, error) {
@@ -22,6 +24,27 @@ func (m *mockSynologyClient) FetchTasks() ([]Task, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.tasks, m.err
+}
+
+func (m *mockSynologyClient) DeleteTasks(ids []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	m.deletedIDs = append(m.deletedIDs, ids...)
+	remaining := m.tasks[:0]
+	toDelete := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		toDelete[id] = true
+	}
+	for _, t := range m.tasks {
+		if !toDelete[t.ID] {
+			remaining = append(remaining, t)
+		}
+	}
+	m.tasks = remaining
+	return nil
 }
 
 func (m *mockSynologyClient) setTasks(tasks []Task) {
