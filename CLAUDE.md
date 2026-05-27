@@ -44,11 +44,35 @@ ssh 192.168.1.34 '
 
 Verify after start: `tail ~/tg-fsyn/tg-fsyn.log` — expect `Authorized on account TorDownBot` and *no* `Conflict: terminated by other getUpdates request` lines after that point.
 
-Autostart: DSM Control Panel → Task Scheduler → Triggered Task → Boot-up → User: `ag0n1k` → command:
+### Autostart: watchdog via /etc/crontab
+
+A DSM **boot-up Triggered Task is not enough** — it only fires at boot and can
+never recover a bot that died on a network error while the NAS stayed up (this
+is exactly what happened 2026-05-18: the process died at 06:56 on `tls: bad
+record MAC`, hours before a reboot, and stayed dead for 9 days). The robust fix
+is a **watchdog** that re-checks the process every few minutes.
+
+`watchdog.sh` (checked into the repo, deployed to `~/tg-fsyn/watchdog.sh`) is
+idempotent + flock-guarded: it starts the bot only if `ps` shows no `./tg-fsyn`,
+and the lock prevents overlapping ticks from spawning a second instance (which
+would cause Telegram 409 Conflict).
+
+The NAS runs the classic `/usr/sbin/crond -n` which reads `/etc/crontab` (that's
+where the system `synoschedtask` lines live too). Register the watchdog there —
+**tabs between fields, with a `who` column**, user `ag0n1k` so the bot does not
+run as root:
 ```
-pkill -f '\./tg-fsyn$' ; cd /var/services/homes/ag0n1k/tg-fsyn && nohup ./tg-fsyn >> tg-fsyn.log 2>&1 &
+*/5	*	*	*	*	ag0n1k	/var/services/homes/ag0n1k/tg-fsyn/watchdog.sh
 ```
-The leading `pkill` is defensive — guards against zombie processes from a botched manual restart.
+Editing `/etc/crontab` needs root and `sudo` here prompts for a password, so run
+this from a terminal that can answer the prompt (`ssh -t`):
+```bash
+ssh -t 192.168.1.34 'sudo sh -c '\''grep -q "tg-fsyn/watchdog.sh" /etc/crontab || printf "*/5\t*\t*\t*\t*\tag0n1k\t/var/services/homes/ag0n1k/tg-fsyn/watchdog.sh\n" >> /etc/crontab; synosystemctl restart crond || systemctl restart crond'\'''
+```
+This covers both failure modes (reboot → crond comes back and restarts the bot
+within 5 min; process death → same). The old boot-up Triggered Task is now
+redundant and can be removed in Task Scheduler (harmless if left — the watchdog
+is idempotent).
 
 ### Secrets handling
 
