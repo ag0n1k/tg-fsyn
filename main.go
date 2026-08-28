@@ -810,6 +810,11 @@ func main() {
 		log.Fatal("TELEGRAM_BOT_TOKEN environment variable is required")
 	}
 
+	// Install the redacting log writer before anything else can log: both
+	// the bot token and the Synology password travel inside URLs that our
+	// dependencies quote verbatim in network error messages.
+	log.SetOutput(newRedactingWriter(os.Stderr, token, os.Getenv("SYNOLOGY_PASSWORD")))
+
 	storagePath := os.Getenv("STORAGE_PATH")
 	if storagePath == "" {
 		storagePath = DefaultStoragePath
