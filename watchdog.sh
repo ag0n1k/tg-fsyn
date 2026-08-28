@@ -13,6 +13,11 @@
 
 BOT_DIR=/var/services/homes/ag0n1k/tg-fsyn
 LOCK="$BOT_DIR/.watchdog.lock"
+DISABLED="$BOT_DIR/.disabled"
+
+# Deliberately stopped via `botctl.sh stop` — stay out of the way until
+# someone runs `botctl.sh start`, otherwise a stop only lasts 5 minutes.
+[ -f "$DISABLED" ] && exit 0
 
 # Serialize watchdog runs; bail out if another tick still holds the lock.
 exec 9>"$LOCK"
@@ -26,4 +31,7 @@ fi
 
 cd "$BOT_DIR" || exit 1
 echo "$(date '+%Y/%m/%d %H:%M:%S') watchdog: bot not running, starting" >> "$BOT_DIR/watchdog.log"
-nohup ./tg-fsyn >> "$BOT_DIR/tg-fsyn.log" 2>&1 < /dev/null &
+# 9>&- is load-bearing: without it the bot inherits the lock fd and
+# holds the flock for its entire lifetime, so every later watchdog tick
+# fails the lock and exits — the watchdog would silently never fire again.
+nohup ./tg-fsyn >> "$BOT_DIR/tg-fsyn.log" 2>&1 < /dev/null 9>&- &
