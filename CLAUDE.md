@@ -141,7 +141,7 @@ Rutracker season packs are re-released weekly with one more episode under a new 
 3. The reply has a "Download everything instead" button (`full:<id>`, torrent kept in memory, last 20) → deletes the selective task, drops the torrent into the watch folder.
 4. `ProcessTasks` (after each poll): a staging task whose wanted files are all downloaded (by bytes, not status — finished tasks may end up in `error`) gets its files renamed into `DOWNLOAD_DIR/<title>/` (never overwriting), `synoindex -a` per file, then the task and its staging folder (with boundary-piece stubs of unselected neighbours) are deleted. Idempotent across restarts.
 
-Gotcha found on 2026-10-05: tasks created through the API by the bot's DSM account (`SYNOLOGY_USERNAME`) stayed `waiting` forever (`started_time=0`), while watch-folder tasks of the NAS owner started at once. That account's DS settings had an empty default destination. A staging task that has not started after 15 min is reported to the admins once.
+Gotcha found on 2026-10-05: tasks created through the API by the bot's DSM account (`SYNOLOGY_USERNAME`) stayed `waiting` forever (`started_time=0`), while watch-folder tasks of the NAS owner started at once. Cause: that account's DS default destination was empty. Fixed by logging into DSM as that account → Download Station → Settings → Location → `video`; tasks start at once after that. A staging task that has not started after 15 min is reported to the admins once.
 
 ### Access Control
 
