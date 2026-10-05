@@ -13,7 +13,12 @@ go test -race -v ./...
 
 # Cross-compile for the NAS (Synology aarch64)
 GOOS=linux GOARCH=arm64 go build -o tg-fsyn-arm64 .
+
+# Integration test against the real DownloadStation (runs on the NAS, reads the bot's .env there)
+GOOS=linux GOARCH=arm64 go test -c -tags integration -o dsit .   # usage: header of integration_test.go
 ```
+
+Name test binaries anything but `tg-fsyn*` on the NAS: `watchdog.sh`/`botctl.sh` find the bot by `./tg-fsyn` in `ps`.
 
 История прежнего Docker-варианта осталась в git history (см. коммиты до удаления `Dockerfile`/`build.sh`/`cmd/reindex-sidecar`).
 
@@ -28,21 +33,18 @@ DSM quirks that bit us:
 - **No `pgrep`** in default PATH; `pkill` exists but be wary of patterns.
 - **Telegram getUpdates**: only one bot instance per token. If a redeploy leaves the old process running, both get 409 Conflict.
 
-Redeploy procedure (manual, no script yet):
+Redeploy procedure — always through `botctl.sh` (deployed as `~/tg-fsyn/botctl.sh`): it takes the watchdog's flock, so a cron tick can't start a second instance mid-restart (409 Conflict), and waits for Telegram to release getUpdates. Don't hand-roll `pkill` + `nohup` (that's how three instances got stacked).
 ```bash
 GOOS=linux GOARCH=arm64 go build -o tg-fsyn-arm64 .
-scp -O tg-fsyn-arm64 192.168.1.34:~/tg-fsyn/tg-fsyn.new
-ssh 192.168.1.34 '
-  pkill -f "\./tg-fsyn$" || true
-  sleep 5  # let Telegram release the getUpdates session
-  mv ~/tg-fsyn/tg-fsyn.new ~/tg-fsyn/tg-fsyn
-  chmod +x ~/tg-fsyn/tg-fsyn
-  cd ~/tg-fsyn && nohup ./tg-fsyn >> tg-fsyn.log 2>&1 < /dev/null &
-  disown
-'
+scp -O tg-fsyn-arm64 192.168.1.34:tg-fsyn/tg-fsyn.new
+ssh 192.168.1.34 'cd ~/tg-fsyn && cp -p tg-fsyn tg-fsyn.prev && mv tg-fsyn.new tg-fsyn && chmod +x tg-fsyn && ./botctl.sh restart'
 ```
+Rollback: `mv tg-fsyn.prev tg-fsyn && ./botctl.sh restart`. `botctl.sh {start|stop|restart|status|log [n]}`; `stop` drops a `.disabled` flag the watchdog honours, `start`/`restart` clear it.
 
-Verify after start: `tail ~/tg-fsyn/tg-fsyn.log` — expect `Authorized on account TorDownBot` and *no* `Conflict: terminated by other getUpdates request` lines after that point.
+Verify after start: one `./tg-fsyn` in `ps`, `Authorized on account TorDownBot`, the `Season updates enabled: …` line, and *no* `Conflict: terminated by other getUpdates request` after that point. Read the log through a redaction filter anyway (`tg-fsyn.prev` and older binaries don't redact):
+```bash
+ssh 192.168.1.34 'sed -E "s#/bot[0-9]+:[A-Za-z0-9_-]+#/bot[REDACTED]#g; s#_sid=[^&\" ]+#_sid=[REDACTED]#g" ~/tg-fsyn/tg-fsyn.log | tail -20'
+```
 
 ### Autostart: watchdog via /etc/crontab
 
@@ -81,6 +83,10 @@ is idempotent).
 ssh 192.168.1.34 'umask 077 && /usr/local/bin/docker inspect <container> --format "{{range .Config.Env}}{{println .}}{{end}}" | grep -E "^(SYNOLOGY_|TELEGRAM_|ALLOWED_|ADMIN_|STORAGE_)" > ~/tg-fsyn/.env'
 ```
 Then patch `STORAGE_PATH` (was `/app/files` in container, now `/volume1/torrents` natively) and append `REINDEX_PATHS=/volume1/video`. **Never `docker inspect ... .Config.Env` without filtering the output** — it dumps `TELEGRAM_BOT_TOKEN` and `SYNOLOGY_PASSWORD` to stdout.
+
+The log is redacted since v0.4.0 (`logging.go`): tgbotapi network errors quote `https://api.telegram.org/bot<token>/…` and the DSM login URL carries the password. Binaries before that wrote the token into `tg-fsyn.log` (thousands of times during the 2026-08-28 DNS outage).
+
+Token rotation (done 2026-10-05): the user revokes the token in @BotFather and writes the new one into `~/tg-fsyn/.env` (the old bot then logs `Unauthorized` in a loop), `./botctl.sh stop`, truncate `tg-fsyn.log` (it held the old token), then deploy/`./botctl.sh start`. Check `grep -cE "bot[0-9]+:[A-Za-z0-9_-]{30,}" tg-fsyn.log watchdog.log` → 0.
 
 ### Old Docker container
 
@@ -129,6 +135,8 @@ Image `ag0n1k/tg-fsync:v0.3.2` (note: image name had `fsync`, repo is `fsyn`), c
 | `/id` | Show user ID | All allowed users |
 | `/status` | Cached download tasks | All allowed users |
 | `/reindex` | Recent finished tasks + inline button to run `synoindex -A` on configured paths | All allowed users |
+| `/cleanup` | Finished tasks + inline button to delete them from DS (files kept; staging tasks skipped) | All allowed users |
+| *(document)* | Saved into `STORAGE_PATH` (DS watch folder); a `.torrent` that updates an existing season goes through `SeasonUpdater` instead | All allowed users |
 | `/admin list\|add\|remove\|status` | User management | Admin users only |
 
 Callback queries are dispatched in `handleCallback`: `reindex`, `cleanup`, `full:<id>` (season update → download the whole torrent instead).
@@ -143,6 +151,20 @@ Rutracker season packs are re-released weekly with one more episode under a new 
 
 Gotcha found on 2026-10-05: tasks created through the API by the bot's DSM account (`SYNOLOGY_USERNAME`) stayed `waiting` forever (`started_time=0`), while watch-folder tasks of the NAS owner started at once. Cause: that account's DS default destination was empty. Fixed by logging into DSM as that account → Download Station → Settings → Location → `video`; tasks start at once after that. A staging task that has not started after 15 min is reported to the admins once.
 
+Observed on the real NAS (2026-10-05): with only the new file selected, Transmission wrote nothing for the unselected neighbours into staging (no boundary stubs appeared, the code still cleans them up), and the whole cycle — queue, download, move — ran in ~45 s for a 20 MB episode with fast polling.
+
+### DownloadStation API notes
+
+- DS 4.1 (build 5012); BT engine is `transmissiond`, a Transmission 4.x fork. Watch-folder tasks run as the NAS owner, API-created tasks as `SYNOLOGY_USERNAME`; the per-user DS settings (default destination!) apply.
+- v1 `SYNO.DownloadStation.Task list` with `additional=detail,file`: `detail.destination` is share-relative (`video`, `video/.tg-fsyn-staging`), `detail.create_time`/`started_time` are unix seconds, each `file` has `filename` (path inside the torrent root, no root), `size`, `size_downloaded`, `priority`, `wanted`. A task that has not started reports **no files**.
+- DS2 `Task.List.get` names files with the root: `<torrent name>/<path>`.
+- DS2 calls go to `entry.cgi` with every param JSON-encoded (`destination="video/x"`, `selected=[2]`, `create_list=true`). The upload is multipart with `file=["torrent"]` and a part named `torrent`. `Task.List.Polling.download` returns a polling id; `download_status` until `finish`, then `download_stop`; the created task id is in `data.data.task_id[0]`.
+- These API shapes were read from the DS web UI (`/var/packages/DownloadStation/target/ui/download.js`) — the place to look when something changes after a DS update.
+- While DS hash-checks a large torrent, every API call takes 10–30 s (slow disks), hence the 2 min HTTP timeout.
+
+### Testing season updates end-to-end
+
+Without touching real torrents: on the laptop, a scratch Go program (outside the repo, `github.com/anacrolix/torrent`) generates a fake season of three ~20 MB episodes with sizes not aligned to the piece length, writes `v1.torrent` (E01–E02) and `v2.torrent` (E01–E03), both `private` with the announce URL pointing at a ~40-line HTTP tracker in the same program (compact peer list that always includes the seeder), and seeds both on the LAN. Drop `v1.torrent` into `/volume1/torrents` (downloads in seconds), then send `v2.torrent` to the bot → expect "Already on disk: 2 of 3" and, ~30 s after E03 completes, "moved 1 new file". Clean up the test season with `synoindex -D <dir>` before `rm -rf`.
 ### Access Control
 
 - `ALLOWED_USERS` env — comma-separated Telegram user IDs. Empty = allow all.
@@ -167,3 +189,5 @@ Optional:
 - Telegram lib: `github.com/go-telegram-bot-api/telegram-bot-api/v5`
 - No ORM, no database — in-memory state only
 - Tests use short tick intervals (50ms) for fast execution
+- Releases: GitHub releases `vX.Y.Z` on `main` (`gh release create`, notes in English). The old Docker image went up to `v0.3.2` while git tags stopped at `v0.2.0`, so native releases continue from `v0.4.0`.
+- Repo is public: no NAS account names, tokens, chat IDs or other environment values in code, tests, docs or commit messages — `.env` only.
