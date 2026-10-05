@@ -14,6 +14,12 @@ type BotSender interface {
 	Send(c tgbotapi.Chattable) (tgbotapi.Message, error)
 }
 
+// TaskProcessor sees every fresh task list and may claim tasks as its own.
+type TaskProcessor interface {
+	ProcessTasks(tasks []Task)
+	OwnsTask(t Task) bool
+}
+
 // StatusService manages the status monitoring with periodic polling.
 type StatusService struct {
 	mu               sync.RWMutex
@@ -26,6 +32,7 @@ type StatusService struct {
 	botAPI       BotSender
 	tickInterval time.Duration
 	stopCh       chan struct{}
+	processor    TaskProcessor
 }
 
 // NewStatusService creates a new status service.
@@ -60,6 +67,11 @@ func (s *StatusService) Start() {
 	}()
 }
 
+// SetTaskProcessor installs p; call it before Start.
+func (s *StatusService) SetTaskProcessor(p TaskProcessor) {
+	s.processor = p
+}
+
 // Stop stops the status monitoring gracefully.
 func (s *StatusService) Stop() {
 	close(s.stopCh)
@@ -74,8 +86,6 @@ func (s *StatusService) checkStatus() {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	s.tasks = tasks
 	s.lastChecked = time.Now()
 
@@ -87,6 +97,17 @@ func (s *StatusService) checkStatus() {
 		}
 		s.previousStatuses[task.ID] = task.Status
 	}
+	s.mu.Unlock()
+
+	if s.processor != nil {
+		s.processor.ProcessTasks(tasks)
+	}
+}
+
+// cleanable reports whether /cleanup may delete the task. Tasks owned by the
+// processor are skipped: deleting them early would strand their files.
+func (s *StatusService) cleanable(task Task) bool {
+	return task.Status == "finished" && (s.processor == nil || !s.processor.OwnsTask(task))
 }
 
 // GetStatus returns the current cached status information.
@@ -134,13 +155,14 @@ func (s *StatusService) RecentFinishedTasks(within time.Duration) []Task {
 	return out
 }
 
-// FinishedTasks returns a snapshot of currently-cached finished tasks.
+// FinishedTasks returns a snapshot of currently-cached finished tasks that
+// /cleanup may delete.
 func (s *StatusService) FinishedTasks() []Task {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var out []Task
 	for _, task := range s.tasks {
-		if task.Status == "finished" {
+		if s.cleanable(task) {
 			out = append(out, task)
 		}
 	}
@@ -155,7 +177,7 @@ func (s *StatusService) CleanupFinishedTasks() ([]Task, error) {
 	var toDelete []Task
 	var ids []string
 	for _, task := range s.tasks {
-		if task.Status == "finished" {
+		if s.cleanable(task) {
 			toDelete = append(toDelete, task)
 			ids = append(ids, task.ID)
 		}
@@ -211,16 +233,18 @@ func (s *StatusService) FormatStatusMessage() string {
 func (s *StatusService) notifyStatusChange(task Task, previousStatus string) {
 	log.Printf("Task status changed: %s (was %s, now %s)", task.Title, previousStatus, task.Status)
 
-	if s.botAPI != nil {
-		message := fmt.Sprintf("🔔 Status Change Alert:\n\nTask: %s\nPrevious Status: %s\nNew Status: %s\n\nLast updated: %s",
-			task.Title, previousStatus, task.Status, time.Now().Format("2006-01-02 15:04:05"))
+	s.NotifyAdmins(fmt.Sprintf("🔔 Status Change Alert:\n\nTask: %s\nPrevious Status: %s\nNew Status: %s\n\nLast updated: %s",
+		task.Title, previousStatus, task.Status, time.Now().Format("2006-01-02 15:04:05")))
+}
 
-		for userID := range s.adminUsers {
-			msg := tgbotapi.NewMessage(userID, message)
-			_, err := s.botAPI.Send(msg)
-			if err != nil {
-				log.Printf("Failed to send status change notification to user %d: %v", userID, err)
-			}
+// NotifyAdmins sends text to every admin user.
+func (s *StatusService) NotifyAdmins(text string) {
+	if s.botAPI == nil {
+		return
+	}
+	for userID := range s.adminUsers {
+		if _, err := s.botAPI.Send(tgbotapi.NewMessage(userID, text)); err != nil {
+			log.Printf("Failed to send notification to user %d: %v", userID, err)
 		}
 	}
 }

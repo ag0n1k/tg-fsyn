@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,26 @@ type mockSynologyClient struct {
 	calls      int32 // atomic
 	deleteErr  error
 	deletedIDs []string
+	added      []addCall
+	addErr     error
+	addTaskID  string
+}
+
+type addCall struct {
+	torrent     []byte
+	fileName    string
+	destination string
+	wanted      map[string]bool
+}
+
+func (m *mockSynologyClient) AddTorrentSelective(torrent []byte, fileName, destination string, wanted map[string]bool) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.added = append(m.added, addCall{torrent, fileName, destination, wanted})
+	if m.addErr != nil {
+		return "", m.addErr
+	}
+	return m.addTaskID, nil
 }
 
 func (m *mockSynologyClient) FetchTasks() ([]Task, error) {
@@ -383,4 +404,64 @@ func searchString(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// recordingProcessor is a TaskProcessor that owns tasks with a given
+// destination and records every task list it sees.
+type recordingProcessor struct {
+	mu   sync.Mutex
+	dest string
+	seen [][]Task
+}
+
+func (p *recordingProcessor) ProcessTasks(tasks []Task) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.seen = append(p.seen, tasks)
+}
+
+func (p *recordingProcessor) OwnsTask(t Task) bool {
+	return t.Additional.Detail.Destination == p.dest
+}
+
+func TestProcessorSeesEveryFetch(t *testing.T) {
+	client := &mockSynologyClient{tasks: []Task{{ID: "1", Status: "downloading"}}}
+	svc := newTestService(client, &mockBotSender{}, time.Hour)
+	proc := &recordingProcessor{dest: "video/st"}
+	svc.SetTaskProcessor(proc)
+
+	svc.checkStatus()
+	svc.checkStatus()
+
+	if len(proc.seen) != 2 || len(proc.seen[1]) != 1 || proc.seen[1][0].ID != "1" {
+		t.Errorf("processor saw %v", proc.seen)
+	}
+}
+
+func TestCleanupSkipsTasksOwnedByProcessor(t *testing.T) {
+	staged := Task{ID: "2", Title: "Staged", Status: "finished"}
+	staged.Additional.Detail.Destination = "video/st"
+	client := &mockSynologyClient{tasks: []Task{{ID: "1", Title: "Plain", Status: "finished"}, staged}}
+	svc := newTestService(client, &mockBotSender{}, time.Hour)
+	svc.SetTaskProcessor(&recordingProcessor{dest: "video/st"})
+	svc.checkStatus()
+
+	if got := svc.FinishedTasks(); len(got) != 1 || got[0].ID != "1" {
+		t.Errorf("FinishedTasks = %v", got)
+	}
+	if _, err := svc.CleanupFinishedTasks(); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(client.deletedIDs) != "[1]" {
+		t.Errorf("deleted = %v", client.deletedIDs)
+	}
+}
+
+func TestNotifyAdminsSendsToEveryAdmin(t *testing.T) {
+	sender := &mockBotSender{}
+	svc := NewStatusService(&mockSynologyClient{}, map[int64]bool{1: true, 2: true}, sender, time.Hour)
+	svc.NotifyAdmins("hello")
+	if got := len(sender.getMessages()); got != 2 {
+		t.Errorf("sent %d messages, want 2", got)
+	}
 }

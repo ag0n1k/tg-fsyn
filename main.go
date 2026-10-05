@@ -17,6 +17,7 @@ import (
 
 const (
 	DefaultStoragePath   = "./files"
+	DefaultDownloadDir   = "/volume1/video"
 	MaxFileSize          = 50 * 1024 * 1024 // 50MB
 	StatusUpdateInterval = 5 * time.Minute
 	RecentFinishedWindow = 24 * time.Hour
@@ -34,14 +35,30 @@ type Task struct {
 	Username   string `json:"username"`
 	Additional struct {
 		Detail struct {
-			CompletedTime int64 `json:"completed_time"`
-			StartedTime   int64 `json:"started_time"`
+			CreateTime    int64  `json:"create_time"`
+			CompletedTime int64  `json:"completed_time"`
+			StartedTime   int64  `json:"started_time"`
+			Destination   string `json:"destination"`
 		} `json:"detail"`
-		File []struct {
-			Name string `json:"name"`
-			Size int64  `json:"size"`
-		} `json:"file"`
+		File []TaskFile `json:"file"`
 	} `json:"additional"`
+}
+
+// TaskFile is one file of a BT task as the v1 task list reports it.
+type TaskFile struct {
+	Filename       string `json:"filename"` // path inside the torrent's root folder
+	Size           int64  `json:"size"`
+	SizeDownloaded int64  `json:"size_downloaded"`
+	Priority       string `json:"priority"`
+	Wanted         *bool  `json:"wanted"`
+}
+
+// IsWanted reports whether the file is selected for download.
+func (f TaskFile) IsWanted() bool {
+	if f.Wanted != nil {
+		return *f.Wanted
+	}
+	return f.Priority != "skip"
 }
 
 type Bot struct {
@@ -51,6 +68,7 @@ type Bot struct {
 	adminUsers    map[int64]bool
 	statusService *StatusService
 	reindexer     Reindexer
+	seasonUpdater *SeasonUpdater
 }
 
 func NewBot(token, storagePath string, allowedUsers, adminUsers []int64) (*Bot, error) {
@@ -100,16 +118,27 @@ func NewBot(token, storagePath string, allowedUsers, adminUsers []int64) (*Bot, 
 	statusSvc := NewStatusService(synClient, adminMap, bot, StatusUpdateInterval)
 
 	var reindexer Reindexer
+	var synoindex *synoindexRunner
 	synoindexBin := os.Getenv("SYNOINDEX_BIN")
 	if synoindexBin == "" {
 		synoindexBin = "/usr/syno/bin/synoindex"
 	}
 	reindexPaths := parseReindexPaths(os.Getenv("REINDEX_PATHS"))
 	if _, err := os.Stat(synoindexBin); err == nil {
-		reindexer = NewSynoindexRunner(synoindexBin, reindexPaths)
+		synoindex = NewSynoindexRunner(synoindexBin, reindexPaths)
+		reindexer = synoindex
 		log.Printf("Reindex enabled: bin=%s, paths=%v", synoindexBin, reindexPaths)
 	} else {
 		log.Printf("Reindex disabled: %s not found", synoindexBin)
+	}
+
+	seasonUpdater := newSeasonUpdaterFromEnv(synClient, storagePath)
+	if seasonUpdater != nil {
+		seasonUpdater.notify = statusSvc.NotifyAdmins
+		if synoindex != nil {
+			seasonUpdater.indexFile = synoindex.IndexFile
+		}
+		statusSvc.SetTaskProcessor(seasonUpdater)
 	}
 
 	return &Bot{
@@ -119,7 +148,32 @@ func NewBot(token, storagePath string, allowedUsers, adminUsers []int64) (*Bot, 
 		adminUsers:    adminMap,
 		statusService: statusSvc,
 		reindexer:     reindexer,
+		seasonUpdater: seasonUpdater,
 	}, nil
+}
+
+// newSeasonUpdaterFromEnv enables selective season updates when DOWNLOAD_DIR
+// (default /volume1/video) exists; returns nil otherwise.
+func newSeasonUpdaterFromEnv(synClient SynologyClient, watchDir string) *SeasonUpdater {
+	downloadDir := os.Getenv("DOWNLOAD_DIR")
+	if downloadDir == "" {
+		downloadDir = DefaultDownloadDir
+	}
+	if st, err := os.Stat(downloadDir); err != nil || !st.IsDir() {
+		log.Printf("Season updates disabled: download dir %s not found", downloadDir)
+		return nil
+	}
+	stagingDir := os.Getenv("STAGING_DIR")
+	if stagingDir == "" {
+		stagingDir = filepath.Join(downloadDir, DefaultStagingDirName)
+	}
+	u, err := NewSeasonUpdater(synClient, downloadDir, stagingDir, watchDir)
+	if err != nil {
+		log.Printf("Season updates disabled: %v", err)
+		return nil
+	}
+	log.Printf("Season updates enabled: download dir %s, staging %s (DownloadStation destination %s)", u.downloadDir, u.stagingDir, u.stagingDest)
+	return u
 }
 
 func parseReindexPaths(s string) []string {
@@ -223,6 +277,11 @@ func (b *Bot) handleDocument(document *tgbotapi.Document, chatID int64, messageI
 		fileName = fmt.Sprintf("document_%d_%s", time.Now().Unix(), document.FileID)
 	}
 
+	if b.seasonUpdater != nil && strings.EqualFold(filepath.Ext(fileName), ".torrent") {
+		b.handleTorrent(document.FileID, fileName, chatID)
+		return
+	}
+
 	if err := b.downloadAndSave(document.FileID, fileName, chatID); err != nil {
 		log.Printf("Error handling document: %v", err)
 		b.sendTextMessage(chatID, "Failed to save the document.")
@@ -233,6 +292,68 @@ func (b *Bot) handleDocument(document *tgbotapi.Document, chatID int64, messageI
 	b.forceStatusUpdate(chatID)
 
 	b.sendTextMessage(chatID, fmt.Sprintf("✅ '%s'", fileName))
+}
+
+// handleTorrent checks whether the torrent updates a season already on disk.
+// If not, it is dropped into the watch folder like any other document.
+func (b *Bot) handleTorrent(fileID, fileName string, chatID int64) {
+	data, err := b.fetchFile(fileID)
+	if err != nil {
+		log.Printf("Error handling torrent: %v", err)
+		b.sendTextMessage(chatID, "Failed to save the document.")
+		return
+	}
+
+	out := b.seasonUpdater.HandleTorrent(data, fileName)
+	if !out.Handled {
+		path := filepath.Join(b.storagePath, filepath.Base(fileName))
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			log.Printf("Error handling torrent: %v", err)
+			b.sendTextMessage(chatID, "Failed to save the document.")
+			return
+		}
+		log.Printf("File saved: %s from user %d", path, chatID)
+		b.forceStatusUpdate(chatID)
+		b.sendTextMessage(chatID, fmt.Sprintf("✅ '%s'", fileName))
+		return
+	}
+
+	msg := tgbotapi.NewMessage(chatID, out.Text)
+	if out.PendingID != "" {
+		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("⬇️ Download everything instead", FullDownloadCallbackPrefix+out.PendingID),
+			),
+		)
+	}
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Failed to send season update message: %v", err)
+	}
+	b.forceStatusUpdate(chatID)
+}
+
+// fetchFile downloads a Telegram file into memory, up to MaxFileSize.
+func (b *Bot) fetchFile(fileID string) ([]byte, error) {
+	file, err := b.api.GetFile(tgbotapi.FileConfig{FileID: fileID})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get file info: %w", err)
+	}
+	resp, err := http.Get(file.Link(b.api.Token))
+	if err != nil {
+		return nil, fmt.Errorf("failed to download file: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to download file: HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, MaxFileSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+	if len(data) > MaxFileSize {
+		return nil, fmt.Errorf("file is larger than %d bytes", MaxFileSize)
+	}
+	return data, nil
 }
 
 func (b *Bot) handlePhoto(photo *tgbotapi.PhotoSize, chatID int64, messageID int) {
@@ -417,6 +538,8 @@ func (b *Bot) sendHelpMessage(chatID int64) {
 • Voice messages: OGG format
 • Video notes: Circular videos
 • Stickers: WEBP format
+
+📺 A .torrent for a season folder that already exists on the NAS downloads only the episodes that are missing, then moves them into that folder.
 
 Files are stored with timestamps and file IDs for easy identification.`
 
@@ -615,11 +738,13 @@ func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
 		return
 	}
 
-	switch cb.Data {
-	case ReindexCallbackData:
+	switch {
+	case cb.Data == ReindexCallbackData:
 		b.handleReindexCallback(cb)
-	case CleanupCallbackData:
+	case cb.Data == CleanupCallbackData:
 		b.handleCleanupCallback(cb)
+	case strings.HasPrefix(cb.Data, FullDownloadCallbackPrefix):
+		b.handleFullDownloadCallback(cb)
 	default:
 		ack := tgbotapi.NewCallback(cb.ID, "Unknown action")
 		_, _ = b.api.Request(ack)
@@ -650,6 +775,29 @@ func (b *Bot) handleReindexCallback(cb *tgbotapi.CallbackQuery) {
 		indexed = "media library"
 	}
 	b.sendTextMessage(chatID, fmt.Sprintf("✅ Reindex triggered: %s", indexed))
+}
+
+func (b *Bot) handleFullDownloadCallback(cb *tgbotapi.CallbackQuery) {
+	if b.seasonUpdater == nil {
+		_, _ = b.api.Request(tgbotapi.NewCallback(cb.ID, "Season updates are disabled"))
+		return
+	}
+	_, _ = b.api.Request(tgbotapi.NewCallback(cb.ID, "Queuing the full torrent…"))
+
+	chatID := cb.Message.Chat.ID
+	name, err := b.seasonUpdater.DownloadFull(strings.TrimPrefix(cb.Data, FullDownloadCallbackPrefix))
+	if err != nil {
+		log.Printf("Full download failed: %v", err)
+		b.sendTextMessage(chatID, fmt.Sprintf("❌ %v", err))
+		return
+	}
+	// The button has done its job; drop it so it cannot be pressed twice.
+	edit := tgbotapi.NewEditMessageReplyMarkup(chatID, cb.Message.MessageID, tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}})
+	if _, err := b.api.Request(edit); err != nil {
+		log.Printf("Failed to remove the button: %v", err)
+	}
+	b.sendTextMessage(chatID, fmt.Sprintf("⬇️ Queued the whole torrent for %s. DownloadStation will hash-check everything already on disk first.", name))
+	b.forceStatusUpdate(chatID)
 }
 
 func (b *Bot) handleCleanupCommand(chatID int64) {

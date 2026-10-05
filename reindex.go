@@ -50,3 +50,12 @@ func (r *synoindexRunner) Reindex() (string, error) {
 	}
 	return result, nil
 }
+
+// IndexFile adds one file to the media index (synoindex -a).
+func (r *synoindexRunner) IndexFile(path string) error {
+	out, err := exec.Command(r.bin, "-a", path).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("synoindex -a %s: %w (%s)", path, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}

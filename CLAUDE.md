@@ -97,12 +97,17 @@ Image `ag0n1k/tg-fsync:v0.3.2` (note: image name had `fsync`, repo is `fsyn`), c
 | `main.go` | Bot struct, Telegram message handlers, main() |
 | `status_service.go` | StatusService — periodic polling, caching, notifications |
 | `synology.go` | SynologyClient interface + HTTP implementation |
-| `reindex.go` | Reindexer — wraps `synoindex -A` via os/exec |
-| `status_service_test.go` | Unit tests with mocks |
+| `reindex.go` | Reindexer — wraps `synoindex -A` / `-a` via os/exec |
+| `torrent.go` | Minimal bencode decoder + `ParseTorrent` (name, file list, path validation) |
+| `seasonupdate.go` | SeasonUpdater — selective download of season updates, staging → season folder |
+| `logging.go` | Redacting log writer (bot token, Synology password) |
+| `*_test.go` | Unit tests with mocks; `synology_test.go` runs against a fake DSM API |
+| `integration_test.go` | `-tags integration`, runs on the NAS against the real DownloadStation (usage in the file header) |
 
 ### Key Interfaces
 
-- **`SynologyClient`** — `FetchTasks() ([]Task, error)`. Production: `synologyHTTPClient`. Tests: `mockSynologyClient`.
+- **`SynologyClient`** — `FetchTasks`, `DeleteTasks`, `AddTorrentSelective`. Production: `synologyHTTPClient` (HTTP timeout 2 min: DS answers in 10–30 s while it hash-checks). Tests: `mockSynologyClient`, `fakeDS`.
+- **`TaskProcessor`** — hook that `StatusService` calls with every fetched task list; tasks it `OwnsTask` are skipped by `/cleanup`. Implemented by `SeasonUpdater`.
 - **`BotSender`** — `Send(tgbotapi.Chattable) (tgbotapi.Message, error)`. Satisfied by `*tgbotapi.BotAPI`. Tests: `mockBotSender`.
 - **`Reindexer`** — `Reindex() (string, error)`. Production: `synoindexRunner` (calls `synoindex -A <path>` for each configured path). Set to nil if the synoindex binary isn't present at startup — `/reindex` then replies that it's unavailable.
 
@@ -125,7 +130,17 @@ Image `ag0n1k/tg-fsync:v0.3.2` (note: image name had `fsync`, repo is `fsyn`), c
 | `/reindex` | Recent finished tasks + inline button to run `synoindex -A` on configured paths | All allowed users |
 | `/admin list\|add\|remove\|status` | User management | Admin users only |
 
-Callback queries are dispatched in `handleCallback` (currently only `reindex`).
+Callback queries are dispatched in `handleCallback`: `reindex`, `cleanup`, `full:<id>` (season update → download the whole torrent instead).
+
+### Season updates (`SeasonUpdater`)
+
+Rutracker season packs are re-released weekly with one more episode under a new infohash. Through the watch folder each update is a new DS task that hash-checks the whole season already on disk (tens of minutes) and re-downloads episodes the releaser replaced. So for a `.torrent` received in Telegram:
+1. `ParseTorrent` → if `DOWNLOAD_DIR/<torrent name>/` exists and holds at least one of its files (by name; `.part` doesn't count), it is an update. Otherwise → watch folder as before.
+2. Only the missing files are queued via the DS2 API (`Task.create` with `create_list=true` → `Task.List.get` → `Task.List.Polling.download` with `selected` indexes), into `STAGING_DIR` where nothing pre-exists, so there is nothing to hash-check. All DS2 params are JSON-encoded, like the DSM web UI sends them.
+3. The reply has a "Download everything instead" button (`full:<id>`, torrent kept in memory, last 20) → deletes the selective task, drops the torrent into the watch folder.
+4. `ProcessTasks` (after each poll): a staging task whose wanted files are all downloaded (by bytes, not status — finished tasks may end up in `error`) gets its files renamed into `DOWNLOAD_DIR/<title>/` (never overwriting), `synoindex -a` per file, then the task and its staging folder (with boundary-piece stubs of unselected neighbours) are deleted. Idempotent across restarts.
+
+Gotcha found on 2026-10-05: tasks created through the API by the bot's DSM account (`SYNOLOGY_USERNAME`) stayed `waiting` forever (`started_time=0`), while watch-folder tasks of the NAS owner started at once. That account's DS settings had an empty default destination. A staging task that has not started after 15 min is reported to the admins once.
 
 ### Access Control
 
@@ -142,6 +157,8 @@ Optional:
 - `ALLOWED_USERS`, `ADMIN_USERS`
 - `SYNOINDEX_BIN` (default `/usr/syno/bin/synoindex`) — feature auto-disables if file doesn't exist
 - `REINDEX_PATHS` (default `/volume1/video`) — comma-separated paths to pass to `synoindex -A`
+- `DOWNLOAD_DIR` (default `/volume1/video`) — where DS puts torrents; season updates auto-disable if it doesn't exist
+- `STAGING_DIR` (default `$DOWNLOAD_DIR/.tg-fsyn-staging`) — must be on the same share as `DOWNLOAD_DIR` (finished files are moved with rename)
 
 ## Conventions
 
