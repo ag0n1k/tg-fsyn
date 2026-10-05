@@ -465,3 +465,48 @@ func TestNotifyAdminsSendsToEveryAdmin(t *testing.T) {
 		t.Errorf("sent %d messages, want 2", got)
 	}
 }
+
+func TestFastPollingOnlyWhileProcessorOwnsATask(t *testing.T) {
+	plain := Task{ID: "1", Status: "downloading"}
+	staged := Task{ID: "2", Status: "downloading"}
+	staged.Additional.Detail.Destination = "video/st"
+
+	client := &mockSynologyClient{tasks: []Task{plain}}
+	svc := newTestService(client, &mockBotSender{}, time.Hour) // base ticker never fires here
+	svc.fastInterval = 20 * time.Millisecond
+	svc.SetTaskProcessor(&recordingProcessor{dest: "video/st"})
+	svc.Start()
+	defer svc.Stop()
+
+	time.Sleep(150 * time.Millisecond)
+	if calls := client.getCalls(); calls != 1 {
+		t.Fatalf("no owned task: expected only the initial fetch, got %d", calls)
+	}
+
+	// A selective download appears (the bot forces a refresh after queuing).
+	client.setTasks([]Task{plain, staged})
+	svc.checkStatus()
+	before := client.getCalls()
+	time.Sleep(150 * time.Millisecond)
+	if got := client.getCalls() - before; got < 3 {
+		t.Fatalf("owned task present: expected fast polls, got %d", got)
+	}
+
+	// It is finalized and deleted: fast polling must settle down by itself...
+	client.setTasks([]Task{plain})
+	time.Sleep(60 * time.Millisecond)
+	before = client.getCalls()
+	time.Sleep(150 * time.Millisecond)
+	if got := client.getCalls() - before; got != 0 {
+		t.Fatalf("owned task gone: expected no fast polls, got %d", got)
+	}
+
+	// ...and resume for the next season update, without any restart.
+	client.setTasks([]Task{plain, staged})
+	svc.checkStatus()
+	before = client.getCalls()
+	time.Sleep(150 * time.Millisecond)
+	if got := client.getCalls() - before; got < 3 {
+		t.Fatalf("second update: expected fast polls again, got %d", got)
+	}
+}

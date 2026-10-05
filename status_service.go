@@ -31,6 +31,7 @@ type StatusService struct {
 	adminUsers   map[int64]bool
 	botAPI       BotSender
 	tickInterval time.Duration
+	fastInterval time.Duration
 	stopCh       chan struct{}
 	processor    TaskProcessor
 }
@@ -42,29 +43,58 @@ func NewStatusService(synology SynologyClient, adminUsers map[int64]bool, botAPI
 		adminUsers:       adminUsers,
 		botAPI:           botAPI,
 		tickInterval:     tickInterval,
+		fastInterval:     FastStatusInterval,
 		previousStatuses: make(map[string]string),
 		stopCh:           make(chan struct{}),
 	}
 }
 
 // Start begins the status monitoring loop.
-// The ticker always runs at the configured interval and never stops.
+//
+// Both tickers are created once and run until Stop; nothing ever stops or
+// replaces them. (Stopping the ticker when all tasks finished, and relying
+// on checkStatus to restart it, is what silently killed polling in March:
+// with no ticker, checkStatus was never called again.) The fast ticker only
+// decides whether to poll: it does so while the processor owns a task, i.e.
+// while a selective season download is in flight.
 func (s *StatusService) Start() {
 	go func() {
 		s.checkStatus()
 
 		ticker := time.NewTicker(s.tickInterval)
 		defer ticker.Stop()
+		fast := time.NewTicker(s.fastInterval)
+		defer fast.Stop()
 
 		for {
 			select {
 			case <-ticker.C:
 				s.checkStatus()
+			case <-fast.C:
+				if s.hasOwnedTasks() {
+					s.checkStatus()
+				}
 			case <-s.stopCh:
 				return
 			}
 		}
 	}()
+}
+
+// hasOwnedTasks reports whether the last fetched task list contains a task
+// owned by the processor.
+func (s *StatusService) hasOwnedTasks() bool {
+	if s.processor == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, task := range s.tasks {
+		if s.processor.OwnsTask(task) {
+			return true
+		}
+	}
+	return false
 }
 
 // SetTaskProcessor installs p; call it before Start.

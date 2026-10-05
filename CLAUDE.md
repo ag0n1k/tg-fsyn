@@ -114,6 +114,7 @@ Image `ag0n1k/tg-fsync:v0.3.2` (note: image name had `fsync`, repo is `fsyn`), c
 ### StatusService
 
 - Polls Synology every 5 minutes (`StatusUpdateInterval`) via a `time.Ticker` that **never stops**
+- A second ticker (`FastStatusInterval`, 30 s) also never stops; on each tick it polls only if the cached task list holds a task owned by the `TaskProcessor` (a selective season download in flight). Never stop/replace either ticker: that is how polling died silently in March (commit 9f31c35)
 - Caches tasks in memory, protected by `sync.RWMutex`
 - Detects status changes and sends Telegram notifications to admin users
 - Graceful shutdown via `stopCh` channel

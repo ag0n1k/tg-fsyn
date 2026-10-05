@@ -20,6 +20,9 @@ const (
 	DefaultDownloadDir   = "/volume1/video"
 	MaxFileSize          = 50 * 1024 * 1024 // 50MB
 	StatusUpdateInterval = 5 * time.Minute
+	// FastStatusInterval applies while a selective season download is in
+	// flight, so its files are moved soon after they complete.
+	FastStatusInterval   = 30 * time.Second
 	RecentFinishedWindow = 24 * time.Hour
 	ReindexCallbackData  = "reindex"
 	CleanupCallbackData  = "cleanup"
